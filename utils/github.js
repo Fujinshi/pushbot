@@ -1,8 +1,7 @@
-const { simpleGit } = require('simple-git');
 const { promises: fs } = require('fs');
 const path = require('path');
-const os = require('os');
 const axios = require('axios');
+const mime = require('mime-types');
 
 async function createRepo(name, token, username) {
   const url = `https://api.github.com/user/repos`;
@@ -25,65 +24,137 @@ async function listRepos(token, username) {
   return res.data;
 }
 
-async function pushZipToNewRepo(extractPath, repoName, token, username) {
-  await createRepo(repoName, token, username);
-  return await pushToRepo(extractPath, repoName, token, username);
-}
-
-async function updateExistingRepo(extractPath, repoName, token, username) {
-  // Check if repo exists
+async function getDefaultBranch(token, username, repoName) {
   try {
     const url = `https://api.github.com/repos/${username}/${repoName}`;
-    await axios.get(url, { headers: { Authorization: `token ${token}` } });
+    const res = await axios.get(url, {
+      headers: { Authorization: `token ${token}` }
+    });
+    return res.data.default_branch;
   } catch (err) {
-    throw new Error(`Repo ${repoName} tidak ditemukan!`);
+    return 'main';
   }
-  return await pushToRepo(extractPath, repoName, token, username, true);
 }
 
-async function pushToRepo(extractPath, repoName, token, username, isUpdate = false) {
-  const repoUrl = `https://${token}@github.com/${username}/${repoName}.git`;
-  const clonePath = path.join(os.tmpdir(), `clone-${Date.now()}`);
-  const git = simpleGit();
+async function uploadFilesToRepo(extractPath, repoName, token, username, isUpdate = false) {
+  // Check if repo exists, if not create it
+  let repoExists = true;
+  try {
+    await axios.get(`https://api.github.com/repos/${username}/${repoName}`, {
+      headers: { Authorization: `token ${token}` }
+    });
+  } catch (err) {
+    repoExists = false;
+    if (!isUpdate) {
+      await createRepo(repoName, token, username);
+    } else {
+      throw new Error(`Repo ${repoName} tidak ditemukan!`);
+    }
+  }
 
-  await git.clone(repoUrl, clonePath);
+  const defaultBranch = await getDefaultBranch(token, username, repoName);
   
-  // Copy files (overwrite if exists)
-  await fs.cp(extractPath, clonePath, { recursive: true, force: true });
+  // Get current commit SHA (for updating)
+  let currentCommitSha = null;
+  let currentTreeSha = null;
   
-  const gitClone = simpleGit(clonePath);
-  
-  // Check if we need to pull first (for update)
-  if (isUpdate) {
+  if (repoExists && isUpdate) {
     try {
-      await gitClone.pull('origin', 'main');
-    } catch (e) {
-      try {
-        await gitClone.pull('origin', 'master');
-      } catch (pullErr) {
-        // Ignore pull errors
+      const refUrl = `https://api.github.com/repos/${username}/${repoName}/git/refs/heads/${defaultBranch}`;
+      const refRes = await axios.get(refUrl, {
+        headers: { Authorization: `token ${token}` }
+      });
+      currentCommitSha = refRes.data.object.sha;
+      
+      const commitUrl = `https://api.github.com/repos/${username}/${repoName}/git/commits/${currentCommitSha}`;
+      const commitRes = await axios.get(commitUrl, {
+        headers: { Authorization: `token ${token}` }
+      });
+      currentTreeSha = commitRes.data.tree.sha;
+    } catch (err) {
+      // Branch mungkin belum ada
+    }
+  }
+
+  // Walk through directory and collect files
+  const files = [];
+  async function walkDir(dir, basePath = '') {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const relativePath = path.join(basePath, entry.name);
+      if (entry.isDirectory()) {
+        await walkDir(fullPath, relativePath);
+      } else {
+        const content = await fs.readFile(fullPath);
+        const contentBase64 = content.toString('base64');
+        files.push({
+          path: relativePath.replace(/\\/g, '/'),
+          content: contentBase64,
+          encoding: 'base64'
+        });
       }
     }
   }
   
-  await gitClone.add('.');
+  await walkDir(extractPath);
   
-  // Check if there are changes
-  const status = await gitClone.status();
-  if (status.files.length === 0) {
-    return `https://github.com/${username}/${repoName} (tidak ada perubahan)`;
-  }
-  
-  await gitClone.commit(`Auto ${isUpdate ? 'update' : 'upload'} from Telegram bot - ${new Date().toISOString()}`);
-  
-  // Push
-  try {
-    await gitClone.push('origin', 'main');
-  } catch (e) {
-    await gitClone.push('origin', 'master');
+  if (files.length === 0) {
+    return `https://github.com/${username}/${repoName} (tidak ada file)`;
   }
 
+  // Create blobs and build tree
+  const blobs = [];
+  for (const file of files) {
+    const blobRes = await axios.post(
+      `https://api.github.com/repos/${username}/${repoName}/git/blobs`,
+      { content: file.content, encoding: file.encoding },
+      { headers: { Authorization: `token ${token}` } }
+    );
+    blobs.push({
+      path: file.path,
+      mode: '100644',
+      type: 'blob',
+      sha: blobRes.data.sha
+    });
+  }
+
+  // Create tree
+  const treeRes = await axios.post(
+    `https://api.github.com/repos/${username}/${repoName}/git/trees`,
+    { base_tree: currentTreeSha, tree: blobs },
+    { headers: { Authorization: `token ${token}` } }
+  );
+  const newTreeSha = treeRes.data.sha;
+
+  // Create commit
+  const commitRes = await axios.post(
+    `https://api.github.com/repos/${username}/${repoName}/git/commits`,
+    {
+      message: `Auto ${isUpdate ? 'update' : 'upload'} from Telegram bot - ${new Date().toISOString()}`,
+      tree: newTreeSha,
+      parents: currentCommitSha ? [currentCommitSha] : []
+    },
+    { headers: { Authorization: `token ${token}` } }
+  );
+  const newCommitSha = commitRes.data.sha;
+
+  // Update branch reference
+  await axios.patch(
+    `https://api.github.com/repos/${username}/${repoName}/git/refs/heads/${defaultBranch}`,
+    { sha: newCommitSha, force: true },
+    { headers: { Authorization: `token ${token}` } }
+  );
+
   return `https://github.com/${username}/${repoName}`;
+}
+
+async function pushZipToNewRepo(extractPath, repoName, token, username) {
+  return await uploadFilesToRepo(extractPath, repoName, token, username, false);
+}
+
+async function updateExistingRepo(extractPath, repoName, token, username) {
+  return await uploadFilesToRepo(extractPath, repoName, token, username, true);
 }
 
 module.exports = { 
